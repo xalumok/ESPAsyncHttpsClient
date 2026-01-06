@@ -15,6 +15,19 @@
   #error "AsyncHttpsClient supports only ESP8266 or ESP32"
 #endif
 
+#ifndef ASYNC_HTTPSCLIENT_DEBUG
+#define ASYNC_HTTPSCLIENT_DEBUG 0
+#endif
+
+#if ASYNC_HTTPSCLIENT_DEBUG
+#ifndef ASYNC_HTTPSCLIENT_LOG_PORT
+#define ASYNC_HTTPSCLIENT_LOG_PORT Serial
+#endif
+#define AHC_DEBUG(fmt, ...) do { ASYNC_HTTPSCLIENT_LOG_PORT.printf("[AsyncHttpsClient] " fmt "\n", ##__VA_ARGS__); } while (0)
+#else
+#define AHC_DEBUG(...) do {} while (0)
+#endif
+
 class AsyncHttpsClient {
 public:
   enum Method : uint8_t { M_GET, M_POST };
@@ -27,6 +40,7 @@ public:
     size_t   maxBodyBytes        = 16 * 1024; // default body buffer limit (can stream instead)
     size_t   ioChunkSize         = 512;    // read buffer size
     bool     keepBody            = true;   // set false to stream-only
+    bool     keepAlive           = false;  // reuse TLS socket between requests when possible
   };
 
   AsyncHttpsClient() = default;
@@ -42,13 +56,22 @@ public:
     // Create/replace trust anchors. X509List copies/parses the PEM.
     _ta.reset(new BearSSL::X509List(_caPem));
 #endif
+    AHC_DEBUG("setCACert: %s", _hasCa ? "loaded" : "empty");
   }
 
   // TLS cert validation requires correct time.
   // Call after SNTP sync, or explicitly set epoch seconds.
-  void setUnixTime(time_t nowEpoch) { _nowEpoch = nowEpoch; _hasTime = (nowEpoch > 1600000000); }
+  void setUnixTime(time_t nowEpoch) {
+    _nowEpoch = nowEpoch;
+    _hasTime = (nowEpoch > 1600000000);
+    AHC_DEBUG("setUnixTime: %ld (valid=%d)", long(nowEpoch), _hasTime);
+  }
 
-  void setOptions(const Options& opt) { _opt = opt; }
+  void setOptions(const Options& opt) {
+    _opt = opt;
+    AHC_DEBUG("setOptions: timeout=%lu bodyCap=%u keepBody=%d", (unsigned long)_opt.timeoutMs,
+              (unsigned)_opt.maxBodyBytes, _opt.keepBody);
+  }
 
   // ---------- Requests ----------
   // path must include query if needed, e.g. "/v1/ping?x=1"
@@ -74,6 +97,7 @@ public:
 #endif
 
     if (millis() - _t0 > _opt.timeoutMs) {
+      AHC_DEBUG("timeout after %lu ms (state=%d)", (unsigned long)(millis() - _t0), _state);
       fail("timeout");
       return;
     }
@@ -102,10 +126,17 @@ public:
   void stop() {
     _client.stop();
     _state = IDLE;
+    AHC_DEBUG("stop -> IDLE");
   }
 
-  void reset() {
-    stop();
+  void reset(bool keepSocket = false) {
+    AHC_DEBUG("reset() state=%d keepSocket=%d", _state, keepSocket);
+    if (!keepSocket) {
+      stop();
+    } else {
+      while (_client.available()) _client.read();
+      _state = IDLE;
+    }
     _err = "";
     _httpStatus = -1;
     _body = "";
@@ -119,6 +150,9 @@ public:
     _chunkState = CHUNK_SIZE;
     _chunkRemaining = 0;
     _chunkLine = "";
+    _stageT0 = 0;
+    _serverRequestedClose = false;
+    _bodyBytesRead = 0;
   }
 
 protected:
@@ -146,16 +180,27 @@ private:
                     const String& host, uint16_t port, const String& path,
                     const String& body, const String& contentType,
                     const String& extraHeaders) {
-    reset();
+    bool reuseSocket = _opt.keepAlive && _client.connected() && !_serverRequestedClose;
+    reset(reuseSocket);
 
     // Enforce TLS-secure prerequisites
-    if (!_hasCa) { fail("TLS CA cert not set (setCACert)"); return false; }
-    if (!_hasTime) { fail("System time not set (setUnixTime / SNTP)"); return false; }
+    if (!_hasCa) {
+      AHC_DEBUG("beginRequest blocked: missing CA cert");
+      fail("TLS CA cert not set (setCACert)");
+      return false;
+    }
+    if (!_hasTime) {
+      AHC_DEBUG("beginRequest blocked: missing Unix time");
+      fail("System time not set (setUnixTime / SNTP)");
+      return false;
+    }
 
     _method = m;
     _host = host;
     _port = port;
     _path = path;
+    AHC_DEBUG("begin %s https://%s:%u%s", m == M_GET ? "GET" : "POST",
+              host.c_str(), port, path.c_str());
 
     // Configure TLS verification
 #if defined(ESP8266)
@@ -173,9 +218,11 @@ private:
     _req.reserve(256 + body.length() + extraHeaders.length());
     _req += (m == M_GET ? F("GET ") : F("POST "));
     _req += path;
-    _req += F(" HTTP/1.1\r\nHost: ");
-    _req += host;
-    _req += F("\r\nUser-Agent: esp-secure/1.0\r\nAccept: */*\r\nConnection: close\r\n");
+  _req += F(" HTTP/1.1\r\nHost: ");
+  _req += host;
+  _req += F("\r\nUser-Agent: esp-secure/1.0\r\nAccept: */*\r\nConnection: ");
+  _req += (_opt.keepAlive ? F("keep-alive") : F("close"));
+  _req += F("\r\n");
 
     if (extraHeaders.length() > 0) {
       // Caller must include proper CRLF lines, e.g. "Authorization: Bearer ...\r\n"
@@ -196,22 +243,33 @@ private:
     }
 
     _t0 = millis();
-    _state = CONNECT;
+    _stageT0 = _t0;
+    _state = reuseSocket ? SEND : CONNECT;
+    if (reuseSocket) {
+      AHC_DEBUG("request ready (%u bytes), reusing TLS session", (unsigned)_req.length());
+    } else {
+      AHC_DEBUG("request ready (%u bytes), entering CONNECT", (unsigned)_req.length());
+    }
     return true;
   }
 
   void stepConnect() {
     if (_client.connected()) {
       _state = SEND;
+      AHC_DEBUG("CONNECT: already connected, moving to SEND");
+      logStageDuration("CONNECT");
       return;
     }
 
     // DNS + TCP + TLS handshake is inside connect() for secure client.
     if (!_client.connect(_host.c_str(), _port)) {
-      fail("connect/TLS failed");
+      AHC_DEBUG("CONNECT: failed to %s:%u", _host.c_str(), _port);
+      fail(String("connect/TLS failed") + tlsErrorDetail());
       return;
     }
 
+    AHC_DEBUG("CONNECT: success to %s:%u", _host.c_str(), _port);
+    logStageDuration("CONNECT");
     _state = SEND;
   }
 
@@ -226,6 +284,8 @@ private:
       fail("send failed");
       return;
     }
+    AHC_DEBUG("SEND: wrote %u bytes", (unsigned)w);
+    logStageDuration("SEND");
     _state = READ_HEADERS;
   }
 
@@ -264,6 +324,8 @@ private:
 
         if (line.length() == 0) {
           _seenHeaderEnd = true;
+          AHC_DEBUG("HEADERS: done (status=%d chunked=%d len=%ld)", _httpStatus, _chunked, (long)_contentLength);
+          logStageDuration("HEADERS");
           _state = READ_BODY;
           return;
         }
@@ -271,6 +333,7 @@ private:
         // Status line
         if (line.startsWith("HTTP/1.1") && line.length() >= 12) {
           _httpStatus = line.substring(9, 12).toInt();
+          AHC_DEBUG("HEADERS: status line %d", _httpStatus);
           continue;
         }
 
@@ -286,6 +349,11 @@ private:
         // Transfer-Encoding: chunked
         if (startsWithNoCase(line, "Transfer-Encoding:")) {
           if (containsNoCase(line, "chunked")) _chunked = true;
+          continue;
+        }
+
+        if (startsWithNoCase(line, "Connection:")) {
+          if (containsNoCase(line, "close")) _serverRequestedClose = true;
           continue;
         }
       }
@@ -305,10 +373,11 @@ private:
     const size_t bufSz = min<size_t>(_opt.ioChunkSize, sizeof(bufLocal));
 
     while (_client.available()) {
+  size_t toRead = min(bufSz, (size_t)_client.available());
 #if defined(ESP8266)
-      int n = _client.readBytes((char*)bufLocal, bufSz);
+  int n = _client.readBytes((char*)bufLocal, toRead);
 #else
-      int n = _client.read(bufLocal, bufSz);
+  int n = _client.read(bufLocal, toRead);
 #endif
       if (n <= 0) break;
 
@@ -316,11 +385,19 @@ private:
         fail(_bodyOverflow ? "body exceeded maxBodyBytes" : "body handler aborted");
         return;
       }
+      _bodyBytesRead += (size_t)n;
+      AHC_DEBUG("BODY: read %d bytes (buffered=%u)", n, (unsigned)_body.length());
+    }
+
+    if (_contentLength >= 0 && _bodyBytesRead >= (size_t)_contentLength) {
+      AHC_DEBUG("BODY: reached Content-Length %ld", (long)_contentLength);
+      finalizeResponse();
+      return;
     }
 
     if (!_client.connected() && !_client.available()) {
-      _client.stop();
-      _state = DONE;
+      AHC_DEBUG("BODY: complete (status=%d)", _httpStatus);
+      finalizeResponse();
     }
   }
 
@@ -351,9 +428,11 @@ private:
 
             if (_chunkRemaining == 0) {
               _chunkState = CHUNK_DONE;
+              AHC_DEBUG("CHUNK: terminal chunk reached");
               // consume trailing headers (optional) until close or empty line
               // We'll just finish once socket closes or no data; many servers close after 0-chunk.
             } else {
+              AHC_DEBUG("CHUNK: size=%u", (unsigned)_chunkRemaining);
               _chunkState = CHUNK_DATA;
             }
           } else {
@@ -367,10 +446,12 @@ private:
           uint8_t one = (uint8_t)ch;
           if (!onBodyChunk(&one, 1)) { fail(_bodyOverflow ? "body exceeded maxBodyBytes" : "body handler aborted"); return; }
           _chunkRemaining--;
+          AHC_DEBUG("CHUNK: wrote 1 byte (remain=%u)", (unsigned)_chunkRemaining);
 
           // Bulk read more if available
           while (_chunkRemaining > 0 && _client.available()) {
             size_t want = min(_chunkRemaining, bufSz);
+            want = min(want, (size_t)_client.available());
 #if defined(ESP8266)
             int n = _client.readBytes((char*)bufLocal, want);
 #else
@@ -380,6 +461,7 @@ private:
 
             if (!onBodyChunk(bufLocal, (size_t)n)) { fail(_bodyOverflow ? "body exceeded maxBodyBytes" : "body handler aborted"); return; }
             _chunkRemaining -= (size_t)n;
+            AHC_DEBUG("CHUNK: wrote %d bytes (remain=%u)", n, (unsigned)_chunkRemaining);
           }
 
           if (_chunkRemaining == 0) _chunkState = CHUNK_CRLF;
@@ -399,8 +481,8 @@ private:
     }
 
     if (!_client.connected() && !_client.available()) {
-      _client.stop();
-      _state = DONE;
+      AHC_DEBUG("CHUNK: body complete (status=%d)", _httpStatus);
+      finalizeResponse();
     }
   }
 
@@ -423,8 +505,74 @@ private:
     return hay.indexOf(ned) >= 0;
   }
 
-  void fail(const char* msg) { _err = msg; _state = ERROR; _client.stop(); }
-  void fail(const String& msg) { _err = msg; _state = ERROR; _client.stop(); }
+  String tlsErrorDetail() {
+#if defined(ESP8266)
+    char buf[128];
+    int code = _client.getLastSSLError(buf, sizeof(buf));
+    if (code == 0) return "";
+    String detail = F(" (ssl ");
+    detail += code;
+    detail += F(": ");
+    detail += buf;
+    detail += ')';
+    return detail;
+#elif defined(ESP32)
+    char buf[128];
+    int code = _client.lastError(buf, sizeof(buf));
+    if (code == 0) return "";
+    String detail = F(" (ssl ");
+    detail += code;
+    if (buf[0]) {
+      detail += F(": ");
+      detail += buf;
+    }
+    detail += ')';
+    return detail;
+#else
+    return "";
+#endif
+  }
+
+  void fail(const char* msg) {
+    logStageDuration("ERROR");
+    AHC_DEBUG("FAIL: %s", msg);
+    _err = msg;
+    _state = ERROR;
+    _client.stop();
+  }
+  void fail(const String& msg) {
+    logStageDuration("ERROR");
+    AHC_DEBUG("FAIL: %s", msg.c_str());
+    _err = msg;
+    _state = ERROR;
+    _client.stop();
+  }
+
+#if ASYNC_HTTPSCLIENT_DEBUG
+  void logStageDuration(const char* tag) {
+    uint32_t now = millis();
+    uint32_t delta = (_stageT0 == 0) ? 0 : now - _stageT0;
+    AHC_DEBUG("%s took %lu ms", tag, (unsigned long)delta);
+    _stageT0 = now;
+  }
+#else
+  void logStageDuration(const char*) {}
+#endif
+
+  void finalizeResponse() {
+    bool keepSocket = _opt.keepAlive && !_serverRequestedClose && _client.connected();
+    if (!keepSocket) {
+      _client.stop();
+      if (_opt.keepAlive) {
+        AHC_DEBUG("KEEP-ALIVE: socket closed (requested=%d connected=%d)",
+                  _serverRequestedClose ? 1 : 0, _client.connected());
+      }
+    } else {
+      AHC_DEBUG("KEEP-ALIVE: socket preserved for next request");
+    }
+    logStageDuration("BODY");
+    _state = DONE;
+  }
 
 private:
   SecureClientT _client;
@@ -461,8 +609,11 @@ private:
   int32_t _contentLength = -1;
   bool _chunked = false;
   bool _seenHeaderEnd = false;
+  bool _serverRequestedClose = false;
+  size_t _bodyBytesRead = 0;
 
   uint32_t _t0 = 0;
+  uint32_t _stageT0 = 0;
 
   // chunked
   ChunkState _chunkState = CHUNK_SIZE;
