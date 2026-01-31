@@ -151,6 +151,7 @@ public:
     _chunkRemaining = 0;
     _chunkLine = "";
     _stageT0 = 0;
+    _headersT0 = 0;
     _serverRequestedClose = false;
     _bodyBytesRead = 0;
   }
@@ -287,12 +288,24 @@ private:
     AHC_DEBUG("SEND: wrote %u bytes", (unsigned)w);
     logStageDuration("SEND");
     _state = READ_HEADERS;
+    _headersT0 = millis();  // Start timing headers from now
   }
 
   void stepReadHeaders() {
     if (!_client.connected() && !_client.available()) {
       fail("closed during headers");
       return;
+    }
+
+    // Early detection of stale keep-alive connections:
+    // If no data received within half the overall timeout, likely stale connection
+    if (_headerBytes == 0 && _headersT0 != 0) {
+      uint32_t waitTime = millis() - _headersT0;
+      if (waitTime > _opt.timeoutMs / 2) {
+        AHC_DEBUG("HEADERS: no data after %lu ms, likely stale connection", (unsigned long)waitTime);
+        fail("no response (stale connection?)");
+        return;
+      }
     }
 
     // Read header bytes and parse lines until \r\n\r\n
@@ -551,7 +564,13 @@ private:
 #if ASYNC_HTTPSCLIENT_DEBUG
   void logStageDuration(const char* tag) {
     uint32_t now = millis();
-    uint32_t delta = (_stageT0 == 0) ? 0 : now - _stageT0;
+    uint32_t delta;
+    // Use dedicated timer for HEADERS stage to avoid timing issues
+    if (strcmp(tag, "HEADERS") == 0 && _headersT0 != 0) {
+      delta = now - _headersT0;
+    } else {
+      delta = (_stageT0 == 0) ? 0 : now - _stageT0;
+    }
     AHC_DEBUG("%s took %lu ms", tag, (unsigned long)delta);
     _stageT0 = now;
   }
@@ -614,6 +633,7 @@ private:
 
   uint32_t _t0 = 0;
   uint32_t _stageT0 = 0;
+  uint32_t _headersT0 = 0;  // Dedicated timer for HEADERS stage
 
   // chunked
   ChunkState _chunkState = CHUNK_SIZE;
